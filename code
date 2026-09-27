@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""
+ip_enrich.py
+
+Enriches a list of IPs with:
+  1. Geolocation / ISP / org / ASN  -- via ip-api.com (free, no key, one bulk call)
+  2. VirusTotal reputation          -- via VT public API v3 (needs YOUR API key)
+
+Usage:
+    pip install requests
+    python ip_enrich.py ips.txt --vt-key YOUR_VT_API_KEY
+    python ip_enrich.py ips.txt                      # geolocation only, skip VT
+
+Input file (ips.txt): one IP per line. Blank lines / a "src_ip" header line are ignored.
+
+Output:
+    ip_enrichment_results.csv   -- one row per IP, ready to copy/paste into Excel
+    Also prints a tab-separated version to the console so you can copy straight
+    out of the terminal if you don't want to open the CSV.
+
+VirusTotal free-tier limits: 4 requests/minute, 500/day. This script paces itself
+at 1 request per 16 seconds to stay safely under that. For 37 IPs that's about
+10 minutes -- let it run in the background.
+
+Where to find your VT API key:
+    virustotal.com -> log in -> click your profile icon (top right) -> API Key
+"""
+
+import argparse
+import csv
+import sys
+import time
+from pathlib import Path
+
+try:
+    import requests
+except ImportError:
+    sys.exit("Missing dependency. Run: pip install requests")
+
+IPAPI_BATCH_URL = "http://ip-api.com/batch"
+VT_IP_URL = "https://www.virustotal.com/api/v3/ip_addresses/{ip}"
+VT_DELAY_SECONDS = 16  # keeps us under VT free tier's 4 req/min
+
+
+def load_ips(path):
+    ips = []
+    for line in Path(path).read_text().splitlines():
+        line = line.strip().strip(",")
+        if not line:
+            continue
+        if line.lower() in ("src_ip", "ip", "ip_address"):
+            continue
+        ips.append(line)
+    # de-dupe, keep order
+    seen = set()
+    out = []
+    for ip in ips:
+        if ip not in seen:
+            seen.add(ip)
+            out.append(ip)
+    return out
+
+
+def geolocate(ips):
+    """One batched POST to ip-api.com. Max 100 IPs per call -- chunk if needed."""
+    results = {}
+    fields = "status,message,country,regionName,city,isp,org,as,query"
+    for i in range(0, len(ips), 100):
+        chunk = ips[i:i + 100]
+        payload = [{"query": ip, "fields": fields} for ip in chunk]
+        try:
+            resp = requests.post(IPAPI_BATCH_URL, json=payload, timeout=20)
+            resp.raise_for_status()
+            for row in resp.json():
+                ip = row.get("query")
+                if row.get("status") == "success":
+                    results[ip] = {
+                        "country": row.get("country", ""),
+                        "region": row.get("regionName", ""),
+                        "city": row.get("city", ""),
+                        "isp": row.get("isp", ""),
+                        "org": row.get("org", ""),
+                        "asn": row.get("as", ""),
+                    }
+                else:
+                    results[ip] = {"country": "", "region": "", "city": "",
+                                    "isp": f"LOOKUP FAILED: {row.get('message','')}",
+                                    "org": "", "asn": ""}
+        except Exception as e:
+            print(f"[!] Geolocation batch failed: {e}")
+            for ip in chunk:
+                results.setdefault(ip, {"country": "", "region": "", "city": "",
+                                         "isp": "ERROR", "org": "", "asn": ""})
+    return results
+
+
+def vt_lookup(ip, api_key):
+    headers = {"x-apikey": api_key}
+    try:
+        resp = requests.get(VT_IP_URL.format(ip=ip), headers=headers, timeout=20)
+        if resp.status_code == 401:
+            return {"vt_malicious": "AUTH ERROR - check API key", "vt_suspicious": "",
+                    "vt_harmless": "", "vt_reputation": ""}
+        if resp.status_code == 429:
+            return {"vt_malicious": "RATE LIMITED", "vt_suspicious": "",
+                    "vt_harmless": "", "vt_reputation": ""}
+        resp.raise_for_status()
+        data = resp.json().get("data", {}).get("attributes", {})
+        stats = data.get("last_analysis_stats", {})
+        return {
+            "vt_malicious": stats.get("malicious", 0),
+            "vt_suspicious": stats.get("suspicious", 0),
+            "vt_harmless": stats.get("harmless", 0),
+            "vt_reputation": data.get("reputation", ""),
+        }
+    except Exception as e:
+        return {"vt_malicious": f"ERROR: {e}", "vt_suspicious": "",
+                "vt_harmless": "", "vt_reputation": ""}
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("ipfile", help="text file, one IP per line")
+    ap.add_argument("--vt-key", default=None, help="VirusTotal API key (optional)")
+    ap.add_argument("-o", "--output", default="ip_enrichment_results.csv")
+    args = ap.parse_args()
+
+    ips = load_ips(args.ipfile)
+    if not ips:
+        sys.exit(f"[!] No IPs found in {args.ipfile}")
+    print(f"[+] Loaded {len(ips)} unique IPs from {args.ipfile}")
+
+    print("[+] Running geolocation / ISP lookup (ip-api.com)...")
+    geo = geolocate(ips)
+    print(f"[+] Geolocation done for {len(geo)} IPs")
+
+    vt_results = {}
+    if args.vt_key:
+        eta_min = round(len(ips) * VT_DELAY_SECONDS / 60, 1)
+        print(f"[+] Running VirusTotal lookups ({len(ips)} IPs, ~{eta_min} min at "
+              f"{VT_DELAY_SECONDS}s/IP to respect free-tier rate limit)...")
+        for i, ip in enumerate(ips, 1):
+            vt_results[ip] = vt_lookup(ip, args.vt_key)
+            print(f"    [{i}/{len(ips)}] {ip} -> "
+                  f"malicious={vt_results[ip]['vt_malicious']} "
+                  f"suspicious={vt_results[ip]['vt_suspicious']}")
+            if i < len(ips):
+                time.sleep(VT_DELAY_SECONDS)
+    else:
+        print("[i] No --vt-key given, skipping VirusTotal. Geolocation-only output.")
+
+    fieldnames = ["ip", "country", "region", "city", "isp", "org", "asn"]
+    if args.vt_key:
+        fieldnames += ["vt_malicious", "vt_suspicious", "vt_harmless", "vt_reputation"]
+
+    rows = []
+    for ip in ips:
+        row = {"ip": ip, **geo.get(ip, {})}
+        if args.vt_key:
+            row.update(vt_results.get(ip, {}))
+        rows.append(row)
+
+    with open(args.output, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        w.writerows(rows)
+
+    print(f"\n[+] Written to: {args.output}")
+    print("\n--- Tab-separated (copy straight from here into Excel if you prefer) ---")
+    print("\t".join(fieldnames))
+    for row in rows:
+        print("\t".join(str(row.get(k, "")) for k in fieldnames))
+
+    flagged = [r for r in rows if isinstance(r.get("vt_malicious"), int) and r["vt_malicious"] > 0]
+    if flagged:
+        print(f"\n[!!] {len(flagged)} IP(s) have a nonzero VirusTotal malicious count:")
+        for r in flagged:
+            print(f"     {r['ip']}  malicious={r['vt_malicious']}  ({r.get('org','')})")
+
+
+if __name__ == "__main__":
+    main()
