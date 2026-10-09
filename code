@@ -14,7 +14,11 @@ The input workbook is never modified; a new workbook is written next to it.
 Install once:   pip install pandas openpyxl
 Run:            python Gacrux_CF_Apache_Merge.py "0924-0925_202_IP_Report_Website_Access_Logs.xlsx"
 
+Share-ready run (what Shawn gets):
+                python Gacrux_CF_Apache_Merge.py "0924-0925_202_IP_Report_Website_Access_Logs.xlsx" --lean
+
 Useful options:
+  --lean                  Drop working columns and diagnostic tabs; adds nothing, removes noise.
   --apache-tz-offset -5   Apache timestamps are server-local with no zone in the export.
                           -5 = US Central Daylight Time (Chicago DC). UTC = local + 5h.
   --window-min 30         Max minutes between a Cloudflare event and an Apache event
@@ -89,6 +93,25 @@ def norm_host(h):
     if h.startswith("www."):
         h = h[4:]
     return h
+
+
+# Second-level public suffixes seen in this estate. A host under one of these keeps
+# three labels (crivo.com.br), everything else keeps two (transunion.com).
+MULTI_LABEL_TLDS = {"com.br", "net.br", "org.br", "co.uk", "org.uk", "com.au", "co.za", "com.mx"}
+
+
+def parent_domain(host):
+    """ping.transunion.com -> transunion.com ; pagbank-admin.crivo.com.br -> crivo.com.br ;
+    checkmyscore.com -> checkmyscore.com (already a bare domain)."""
+    h = norm_host(host)
+    if not h:
+        return ""
+    parts = h.split(".")
+    if len(parts) <= 2:
+        return h
+    if ".".join(parts[-2:]) in MULTI_LABEL_TLDS:
+        return ".".join(parts[-3:])
+    return ".".join(parts[-2:])
 
 
 def norm_path(p):
@@ -223,6 +246,11 @@ def main():
     ap.add_argument("--apache-ip-col", default=None)
     ap.add_argument("--apache-time-col", default=None)
     ap.add_argument("--ignore-host", action="store_true")
+    ap.add_argument("--lean", action="store_true",
+                    help="Share-ready output: drop working columns (Match_Key, Seen_In_Both, deltas, "
+                         "CF_Action_Class, CF_Origin_Response, User_Agent, Notes) and the Delta_Analysis / "
+                         "Column_Mapping tabs. Keeps Merged_Timeline, Blocked_But_Reached_Origin, "
+                         "Summary_By_Domain, Summary_By_Site.")
     args = ap.parse_args()
 
     out = args.out or re.sub(r"\.xlsx$", "", args.xlsx) + "_MERGED.xlsx"
@@ -348,6 +376,10 @@ def main():
     if a_site and apo["Website"].str.contains("/").any():
         apo["Website"] = apo["Website_Raw"].str.extract(r"([a-z0-9][a-z0-9.-]+\.[a-z]{2,})", flags=re.I)[0].map(norm_host)
 
+    # Parent domain (transunion.com / crivo.com.br / mysmartmove.com) so per-vhost noise can be rolled up
+    for df in (cfo, apo):
+        df["Domain"] = df["Website"].map(parent_domain)
+
     use_host = not args.ignore_host and bool(a_site) and apo["Website"].replace("", np.nan).notna().mean() > 0.5
     if not use_host:
         print("[!] Matching on METHOD + PATH only (no usable Apache site column). Pass --apache-site-col to change.")
@@ -400,9 +432,14 @@ def main():
     apo["Flag"] = apo.apply(ap_flag, axis=1)
 
     # ------------------------------------------------------------------ merged timeline
-    cols = ["Timestamp_UTC", "Source", "Website", "Server", "Client_IP", "Apache_Client_IP_Class", "Method", "URI",
-            "WebServer_Response", "CF_Edge_Response", "CF_Origin_Response", "CF_Action", "CF_Action_Class", "CF_Rule",
-            "Seen_In_Both", "Nearest_Other_Delta_Min", "Flag", "User_Agent", "Notes", "Match_Key"]
+    if args.lean:
+        cols = ["Timestamp_UTC", "Source", "Domain", "Website", "Server", "Client_IP", "Method", "URI",
+                "WebServer_Response", "CF_Edge_Response", "CF_Action", "CF_Rule", "Flag"]
+    else:
+        cols = ["Timestamp_UTC", "Source", "Domain", "Website", "Server", "Client_IP", "Apache_Client_IP_Class",
+                "Method", "URI", "WebServer_Response", "CF_Edge_Response", "CF_Origin_Response", "CF_Action",
+                "CF_Action_Class", "CF_Rule", "Seen_In_Both", "Nearest_Other_Delta_Min", "Flag", "User_Agent",
+                "Notes", "Match_Key"]
     merged = pd.concat([cfo, apo], ignore_index=True)
     merged = merged.sort_values(["Timestamp_UTC", "Source"], kind="mergesort").reset_index(drop=True)
     merged_out = merged[cols].copy()
@@ -428,17 +465,18 @@ def main():
     receipts = pd.DataFrame(rows).sort_values(["Within_Window", "CF_Time_UTC"], ascending=[False, True]) if rows else pd.DataFrame(
         columns=["CF_Time_UTC", "Apache_Time_UTC", "Delta_Min (Apache - CF)", "Within_Window", "Website", "Method", "URI"])
 
-    # ------------------------------------------------------------------ summary by site
-    def site_summary():
-        sites = sorted(set(cfo["Website"]) | set(apo["Website"]))
+    # ------------------------------------------------------------------ summary by site / by domain
+    def site_summary(group_col="Website"):
+        sites = sorted(set(cfo[group_col]) | set(apo[group_col]))
         out = []
         for s in sites:
-            c = cfo[cfo["Website"] == s]
-            a = apo[apo["Website"] == s]
+            c = cfo[cfo[group_col] == s]
+            a = apo[apo[group_col] == s]
             both = set(c["Match_Key"]) & set(a["Match_Key"])
             blk = c[c["CF_Action_Class"] == "blocked"]
             out.append({
-                "Website": s or "(unknown)",
+                group_col: s or "(unknown)",
+                **({"Vhosts": int(pd.concat([c["Website"], a["Website"]]).nunique())} if group_col == "Domain" else {}),
                 "CF_Requests": len(c),
                 "CF_Blocked": len(blk),
                 "CF_Challenged": int((c["CF_Action_Class"] == "challenged").sum()),
@@ -456,7 +494,8 @@ def main():
             })
         return pd.DataFrame(out)
 
-    summary = site_summary()
+    summary = site_summary("Website")
+    domain_summary = site_summary("Domain")
 
     # ------------------------------------------------------------------ delta distribution
     dd = cfo.loc[cfo["Seen_In_Both"], "Nearest_Other_Delta_Min"].dropna()
@@ -501,9 +540,11 @@ def main():
     with pd.ExcelWriter(out, engine="openpyxl", datetime_format="yyyy-mm-dd hh:mm:ss.000") as xw:
         merged_out.to_excel(xw, sheet_name="Merged_Timeline", index=False)
         receipts.to_excel(xw, sheet_name="Blocked_But_Reached_Origin", index=False)
+        domain_summary.to_excel(xw, sheet_name="Summary_By_Domain", index=False)
         summary.to_excel(xw, sheet_name="Summary_By_Site", index=False)
-        delta_tbl.to_excel(xw, sheet_name="Delta_Analysis", index=False)
-        mapping_df.to_excel(xw, sheet_name="Column_Mapping", index=False)
+        if not args.lean:
+            delta_tbl.to_excel(xw, sheet_name="Delta_Analysis", index=False)
+            mapping_df.to_excel(xw, sheet_name="Column_Mapping", index=False)
 
         wb = xw.book                                    # the live workbook -- no reload
         fill_cf = PatternFill("solid", fgColor="DDEBF7")      # light blue
@@ -514,7 +555,7 @@ def main():
 
         ws = wb["Merged_Timeline"]
         hdr = {c.value: c.column for c in ws[1]}
-        widths = {"Timestamp_UTC": 24, "Source": 11, "Website": 30, "Server": 14, "Client_IP": 16,
+        widths = {"Timestamp_UTC": 24, "Source": 11, "Domain": 20, "Website": 30, "Server": 14, "Client_IP": 16,
                   "Apache_Client_IP_Class": 20, "Method": 8, "URI": 60, "WebServer_Response": 10,
                   "CF_Edge_Response": 10, "CF_Origin_Response": 10, "CF_Action": 18, "CF_Action_Class": 24,
                   "CF_Rule": 30, "Seen_In_Both": 12, "Nearest_Other_Delta_Min": 14, "Flag": 48,
@@ -535,18 +576,18 @@ def main():
             last_row = ws.max_row
             src_col = get_column_letter(hdr["Source"])
             flag_col = get_column_letter(hdr["Flag"])
-            key_col = get_column_letter(hdr["Match_Key"])
-            both_col = get_column_letter(hdr["Seen_In_Both"])
-            full_range = f"A2:{get_column_letter(ws.max_column)}{last_row}"
             ws.conditional_formatting.add(
                 f"A2:H{last_row}",
                 FormulaRule(formula=[f'${src_col}2="Cloudflare"'], fill=fill_cf))
             ws.conditional_formatting.add(
                 f"A2:H{last_row}",
                 FormulaRule(formula=[f'${src_col}2="Apache"'], fill=fill_ap))
-            ws.conditional_formatting.add(
-                f"{key_col}2:{key_col}{last_row}",
-                FormulaRule(formula=[f'${both_col}2=TRUE'], fill=fill_both))
+            if "Match_Key" in hdr and "Seen_In_Both" in hdr:
+                key_col = get_column_letter(hdr["Match_Key"])
+                both_col = get_column_letter(hdr["Seen_In_Both"])
+                ws.conditional_formatting.add(
+                    f"{key_col}2:{key_col}{last_row}",
+                    FormulaRule(formula=[f'${both_col}2=TRUE'], fill=fill_both))
             ws.conditional_formatting.add(
                 f"{flag_col}2:{flag_col}{last_row}",
                 FormulaRule(formula=[f'OR(LEFT(${flag_col}2,7)="BLOCKED",'
@@ -560,14 +601,17 @@ def main():
                 f = fill_cf if src == "Cloudflare" else fill_ap
                 for cell in row[:8]:
                     cell.fill = f
-                if row[hdr["Seen_In_Both"] - 1].value is True:
+                if "Seen_In_Both" in hdr and row[hdr["Seen_In_Both"] - 1].value is True:
                     row[hdr["Match_Key"] - 1].fill = fill_both
                 fv = str(row[hdr["Flag"] - 1].value or "")
                 if fv.startswith(("BLOCKED", "CHALLENGED", "CF 403", "reached origin although")):
                     row[hdr["Flag"] - 1].fill = fill_bad
                     row[hdr["Flag"] - 1].font = bold
 
-        for name in ("Blocked_But_Reached_Origin", "Summary_By_Site", "Delta_Analysis", "Column_Mapping"):
+        for name in ("Blocked_But_Reached_Origin", "Summary_By_Domain", "Summary_By_Site",
+                     "Delta_Analysis", "Column_Mapping"):
+            if name not in wb.sheetnames:
+                continue
             w = wb[name]
             w.freeze_panes = "A2"
             if w.max_row > 1:
@@ -605,8 +649,15 @@ def main():
     else:
         print("\n[!] Apache sheet has NO client-IP column. Cannot tell whether origin hits came via Cloudflare "
               "edge IPs or directly from the attacker IP. Get the raw access log with %h / X-Forwarded-For.")
+    print("\nBy parent domain:")
+    print(domain_summary[["Domain", "Vhosts", "CF_Requests", "CF_Blocked", "Apache_Requests", "Apache_2xx"]]
+          .to_string(index=False))
     print(f"\nOutput: {out}")
-    print("Sheets: Merged_Timeline | Blocked_But_Reached_Origin | Summary_By_Site | Delta_Analysis | Column_Mapping")
+    if args.lean:
+        print("Sheets: Merged_Timeline | Blocked_But_Reached_Origin | Summary_By_Domain | Summary_By_Site  (--lean)")
+    else:
+        print("Sheets: Merged_Timeline | Blocked_But_Reached_Origin | Summary_By_Domain | Summary_By_Site | "
+              "Delta_Analysis | Column_Mapping")
 
 
 if __name__ == "__main__":
