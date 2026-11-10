@@ -1,664 +1,205 @@
-#!/usr/bin/env python3
-"""
-SecEvent Gacrux - line up Cloudflare edge logs with on-prem Apache access logs
-for the same attacker traffic, so "Cloudflare says blocked" can be compared with
-"what the web server actually logged".
-
-Reads the workbook Shawn exported from Splunk (two tabs: Cloudflare_202_IP_Report
-and Apache_Internal_Access), normalises both, stacks them into ONE timeline sorted
-by UTC time, flags requests seen on both sides, and pulls out the "blocked at
-Cloudflare but still reached the origin" pairs as the receipt for Cloudflare.
-
-The input workbook is never modified; a new workbook is written next to it.
-
-Install once:   pip install pandas openpyxl
-Run:            python Gacrux_CF_Apache_Merge.py "0924-0925_202_IP_Report_Website_Access_Logs.xlsx"
-
-Share-ready run (what Shawn gets):
-                python Gacrux_CF_Apache_Merge.py "0924-0925_202_IP_Report_Website_Access_Logs.xlsx" --lean
-
-Useful options:
-  --lean                  Drop working columns and diagnostic tabs; adds nothing, removes noise.
-  --apache-tz-offset -5   Apache timestamps are server-local with no zone in the export.
-                          -5 = US Central Daylight Time (Chicago DC). UTC = local + 5h.
-  --window-min 30         Max minutes between a Cloudflare event and an Apache event
-                          with the same host+method+path for them to be paired.
-  --apache-site-col NAME  Force which Apache column holds the website/vhost name.
-  --apache-ip-col NAME    Force which Apache column holds the client IP.
-  --ignore-host           Match on method+path only (use if Apache has no site column).
-"""
-import argparse
-import ipaddress
-import re
-import sys
-from datetime import timedelta
-
-import numpy as np
-import pandas as pd
-from openpyxl import load_workbook
-from openpyxl.styles import Alignment, Font, PatternFill
-from openpyxl.utils import get_column_letter
-
-ATTACKER_IP = "202.61.139.15"
-
-# Cloudflare published edge ranges (IPv4). Used only to classify Apache client IPs.
-CF_RANGES = [ipaddress.ip_network(c) for c in (
-    "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
-    "141.101.64.0/18", "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20",
-    "197.234.240.0/22", "198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13",
-    "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
-)]
-
-BLOCK_ACTIONS = {"block", "drop", "connection_close", "force_connection_close"}
-CHALLENGE_ACTIONS = {"challenge", "jschallenge", "js_challenge", "managed_challenge",
-                     "managedchallenge", "challenge_solved", "challenge_failed",
-                     "challenge_bypassed", "jschallenge_solved", "jschallenge_failed"}
-
-
-# ----------------------------------------------------------------------------- helpers
-def norm_name(s):
-    return re.sub(r"[^a-z0-9]", "", str(s).lower())
-
-
-def pick(df, candidates, label, required=False, forced=None, exclude=()):
-    """Pick the first column whose normalised name matches a candidate (exact first,
-    then 'contains'). Returns the real column name or None."""
-    if forced:
-        if forced in df.columns:
-            return forced
-        sys.exit(f"ERROR: --{label} '{forced}' is not a column. Columns: {list(df.columns)}")
-    cols = {norm_name(c): c for c in df.columns}
-    excl = {norm_name(e) for e in exclude}
-    for cand in candidates:                       # exact
-        n = norm_name(cand)
-        if n in cols and n not in excl:
-            return cols[n]
-    for cand in candidates:                       # contains
-        n = norm_name(cand)
-        for k, real in cols.items():
-            if n in k and k not in excl:
-                return real
-    if required:
-        sys.exit(f"ERROR: could not find a column for {label}. Tried {candidates}. "
-                 f"Columns present: {list(df.columns)}")
-    return None
-
-
-def norm_host(h):
-    if h is None or (isinstance(h, float) and np.isnan(h)):
-        return ""
-    h = str(h).strip().lower()
-    h = re.sub(r"^https?://", "", h)
-    h = h.split("/")[0].split(":")[0]
-    if h.startswith("www."):
-        h = h[4:]
-    return h
-
-
-# Second-level public suffixes seen in this estate. A host under one of these keeps
-# three labels (crivo.com.br), everything else keeps two (transunion.com).
-MULTI_LABEL_TLDS = {"com.br", "net.br", "org.br", "co.uk", "org.uk", "com.au", "co.za", "com.mx"}
-
-
-def parent_domain(host):
-    """ping.transunion.com -> transunion.com ; pagbank-admin.crivo.com.br -> crivo.com.br ;
-    checkmyscore.com -> checkmyscore.com (already a bare domain)."""
-    h = norm_host(host)
-    if not h:
-        return ""
-    parts = h.split(".")
-    if len(parts) <= 2:
-        return h
-    if ".".join(parts[-2:]) in MULTI_LABEL_TLDS:
-        return ".".join(parts[-3:])
-    return ".".join(parts[-2:])
-
-
-def norm_path(p):
-    if p is None or (isinstance(p, float) and np.isnan(p)):
-        return ""
-    p = str(p).strip()
-    if not p or p == "-":
-        return ""
-    if "://" in p:                                 # full URL -> path
-        p = "/" + p.split("://", 1)[1].split("/", 1)[1] if "/" in p.split("://", 1)[1] else "/"
-    path_only = p.split("?", 1)[0]
-    if not path_only.startswith("/"):
-        path_only = "/" + path_only
-    if len(path_only) > 1 and path_only.endswith("/"):
-        path_only = path_only.rstrip("/")
-    return path_only.lower()
-
-
-def to_utc(series):
-    """Parse a timestamp column into tz-aware UTC datetimes (handles ISO strings and epochs)."""
-    if pd.api.types.is_datetime64_any_dtype(series):
-        s = pd.to_datetime(series, errors="coerce")
-        return s.dt.tz_localize("UTC") if s.dt.tz is None else s.dt.tz_convert("UTC")
-    if pd.api.types.is_numeric_dtype(series):
-        v = series.astype("float64")
-        unit = "ns" if v.dropna().abs().median() > 1e14 else ("ms" if v.dropna().abs().median() > 1e11 else "s")
-        return pd.to_datetime(v, unit=unit, errors="coerce", utc=True)
-    return pd.to_datetime(series.astype(str).str.strip(), errors="coerce", utc=True, format="mixed")
-
-
-APACHE_TS = re.compile(r"(\d{1,2})/([A-Za-z]{3})/(\d{4}):(\d{2}):(\d{2}):(\d{2})(?:\s*([+-]\d{4}))?")
-APACHE_REQ = re.compile(r"\b(GET|POST|HEAD|PUT|DELETE|OPTIONS|PATCH|PROPFIND|TRACE|CONNECT)\s+(\S+)\s+HTTP/\d(?:\.\d)?")
-
-
-def parse_apache_time(val, default_offset_hours):
-    """'24/Sep/2026:07:52:41' (optionally with ' -0500') -> UTC Timestamp."""
-    if val is None or (isinstance(val, float) and np.isnan(val)):
-        return pd.NaT
-    if isinstance(val, (pd.Timestamp,)) or hasattr(val, "year") and not isinstance(val, str):
-        ts = pd.Timestamp(val)
-        if ts.tzinfo is None:
-            ts = ts.tz_localize("UTC") - timedelta(hours=default_offset_hours)
-        return ts.tz_convert("UTC")
-    m = APACHE_TS.search(str(val))
-    if not m:
-        return pd.NaT
-    d, mon, y, hh, mm, ss, tz = m.groups()
-    try:
-        ts = pd.Timestamp(f"{d} {mon} {y} {hh}:{mm}:{ss}")
-    except Exception:
-        return pd.NaT
-    if tz:
-        sign = 1 if tz[0] == "+" else -1
-        off = sign * (int(tz[1:3]) + int(tz[3:5]) / 60)
-    else:
-        off = default_offset_hours
-    return (ts.tz_localize("UTC") - timedelta(hours=off))
-
-
-def classify_ip(ip):
-    if ip is None or str(ip).strip() in ("", "-", "nan"):
-        return ""
-    s = str(ip).strip().split(",")[0].strip()
-    if s == ATTACKER_IP:
-        return "DIRECT (attacker IP)"
-    try:
-        a = ipaddress.ip_address(s)
-    except ValueError:
-        return "unparsed"
-    if any(a in n for n in CF_RANGES):
-        return "via Cloudflare"
-    if a.is_private:
-        return "internal/private"
-    return "other public"
-
-
-def classify_action(action, edge_status):
-    a = str(action).strip().lower() if action is not None else ""
-    if a in ("", "nan", "none", "-", "unknown"):
-        a = ""
-    if a in BLOCK_ACTIONS:
-        return "blocked"
-    if a in CHALLENGE_ACTIONS:
-        return "challenged"
-    if a in ("allow", "skip", "log", "bypass", "none"):
-        return "allowed"
-    if a:
-        return a
-    # no action column value: fall back to edge status
-    try:
-        es = int(float(edge_status))
-    except (TypeError, ValueError):
-        return "unknown"
-    if es == 403:
-        return "edge 403 (no action recorded)"
-    return "allowed (no action)"
-
-
-def nearest_same_key(src, dst, key_col="Match_Key", t_col="Timestamp_UTC"):
-    """For every row of src, find the dst row with the same key and the nearest time.
-    Returns (delta_minutes Series, index-of-dst Series) aligned to src.index."""
-    delta = pd.Series(np.nan, index=src.index, dtype="float64")
-    idx = pd.Series(-1, index=src.index, dtype="int64")
-    dst_groups = {k: g.sort_values(t_col) for k, g in dst.groupby(key_col)}
-    for k, g in src.groupby(key_col):
-        if k not in dst_groups:
-            continue
-        d = dst_groups[k]
-        dt = d[t_col].values.astype("datetime64[ns]").astype("int64")
-        st = g[t_col].values.astype("datetime64[ns]").astype("int64")
-        pos = np.searchsorted(dt, st)
-        lo = np.clip(pos - 1, 0, len(dt) - 1)
-        hi = np.clip(pos, 0, len(dt) - 1)
-        choose_hi = np.abs(dt[hi] - st) < np.abs(dt[lo] - st)
-        best = np.where(choose_hi, hi, lo)
-        delta.loc[g.index] = (st - dt[best]) / 6e10          # ns -> minutes (src minus dst)
-        idx.loc[g.index] = d.index.values[best]
-    return delta, idx
-
-
-# ----------------------------------------------------------------------------- main
-def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("xlsx")
-    ap.add_argument("--out", default=None)
-    ap.add_argument("--cf-sheet", default="Cloudflare_202_IP_Report")
-    ap.add_argument("--apache-sheet", default="Apache_Internal_Access")
-    ap.add_argument("--apache-tz-offset", type=float, default=-5.0,
-                    help="UTC offset (hours) of the Apache timestamps when none is present. Default -5 (CDT).")
-    ap.add_argument("--window-min", type=float, default=30.0)
-    ap.add_argument("--apache-site-col", default=None)
-    ap.add_argument("--apache-ip-col", default=None)
-    ap.add_argument("--apache-time-col", default=None)
-    ap.add_argument("--ignore-host", action="store_true")
-    ap.add_argument("--lean", action="store_true",
-                    help="Share-ready output: drop working columns (Match_Key, Seen_In_Both, deltas, "
-                         "CF_Action_Class, CF_Origin_Response, User_Agent, Notes) and the Delta_Analysis / "
-                         "Column_Mapping tabs. Keeps Merged_Timeline, Blocked_But_Reached_Origin, "
-                         "Summary_By_Domain, Summary_By_Site.")
-    args = ap.parse_args()
-
-    out = args.out or re.sub(r"\.xlsx$", "", args.xlsx) + "_MERGED.xlsx"
-    mapping = []
-
-    print(f"[*] Reading {args.xlsx}")
-    cf = pd.read_excel(args.xlsx, sheet_name=args.cf_sheet)
-    apache = pd.read_excel(args.xlsx, sheet_name=args.apache_sheet)
-    cf.columns = [str(c).strip() for c in cf.columns]
-    apache.columns = [str(c).strip() for c in apache.columns]
-    print(f"    Cloudflare rows: {len(cf):,}   Apache rows: {len(apache):,}")
-
-    # ------------------------------------------------------------------ Cloudflare
-    c_time = pick(cf, ["EdgeStartTimestamp", "EdgeEndTimestamp", "_time"], "cf time", required=True)
-    c_host = pick(cf, ["ClientRequestHost", "host"], "cf host", required=True)
-    c_meth = pick(cf, ["ClientRequestMethod", "method"], "cf method", required=True)
-    c_path = pick(cf, ["ClientRequestPath"], "cf path")
-    c_uri = pick(cf, ["ClientRequestURI"], "cf uri")
-    if not c_path and not c_uri:
-        sys.exit("ERROR: Cloudflare sheet has neither ClientRequestPath nor ClientRequestURI")
-    c_edge = pick(cf, ["EdgeResponseStatus"], "cf edge status")
-    c_orig = pick(cf, ["OriginResponseStatus"], "cf origin status")
-    c_origip = pick(cf, ["OriginIP"], "cf origin ip")
-    c_act = pick(cf, ["SecurityAction", "WAFAction", "FirewallMatchesActions", "SecurityActions", "Action"],
-                 "cf action", exclude=["BotDetectionIDs"])
-    c_rule = pick(cf, ["SecurityRuleDescription", "FirewallMatchesRuleIDs", "SecurityRuleID", "WAFRuleMessage"], "cf rule")
-    c_ip = pick(cf, ["ClientIP"], "cf client ip")
-    c_ua = pick(cf, ["ClientRequestUserAgent", "UserAgent"], "cf user agent")
-    for k, v in [("time", c_time), ("host", c_host), ("method", c_meth), ("path", c_path), ("uri", c_uri),
-                 ("edge_status", c_edge), ("origin_status", c_orig), ("origin_ip", c_origip),
-                 ("action", c_act), ("rule", c_rule), ("client_ip", c_ip), ("user_agent", c_ua)]:
-        mapping.append(("Cloudflare", k, v or "(not found)"))
-
-    cfo = pd.DataFrame({
-        "Timestamp_UTC": to_utc(cf[c_time]),
-        "Source": "Cloudflare",
-        "Server": "",
-        "Website": cf[c_host].map(norm_host),
-        "Website_Raw": cf[c_host].astype(str),
-        "Client_IP": cf[c_ip].astype(str) if c_ip else "",
-        "Method": cf[c_meth].astype(str).str.upper().str.strip(),
-        "URI": (cf[c_uri] if c_uri else cf[c_path]).astype(str).str.strip(),
-        "Path_Key": (cf[c_path] if c_path else cf[c_uri]).map(norm_path),
-        "WebServer_Response": "",
-        "CF_Edge_Response": cf[c_edge] if c_edge else "",
-        "CF_Origin_Response": cf[c_orig] if c_orig else "",
-        "CF_Origin_IP": cf[c_origip].astype(str) if c_origip else "",
-        "CF_Action": cf[c_act].astype(str) if c_act else "",
-        "CF_Rule": cf[c_rule].astype(str) if c_rule else "",
-        "User_Agent": cf[c_ua].astype(str) if c_ua else "",
-        "Notes": "",
-    })
-    cfo["CF_Action_Class"] = [classify_action(a, e) for a, e in zip(
-        cfo["CF_Action"] if c_act else [None] * len(cfo), cfo["CF_Edge_Response"])]
-
-    # ------------------------------------------------------------------ Apache
-    a_time = pick(apache, ["Date", "Timestamp", "_time", "time"], "apache time", forced=args.apache_time_col)
-    a_raw = pick(apache, ["Raw", "_raw"], "apache raw")
-    a_meth = pick(apache, ["Method", "cs_method"], "apache method")
-    a_path = pick(apache, ["URI Query", "URI", "Path", "uri_path", "request"], "apache path")
-    a_stat = pick(apache, ["HTTP Res", "HTTP Response", "status", "sc_status"], "apache status")
-    a_site = pick(apache, ["Site Name", "Site", "Website", "vhost", "virtual host", "server_name", "domain",
-                           "Website Name", "Request Host", "http_host", "source"], "apache site",
-                  forced=args.apache_site_col)
-    a_srv = pick(apache, ["host", "Server", "hostname"], "apache server", exclude=[a_site] if a_site else ())
-    a_ip = pick(apache, ["Client IP", "client_ip", "clientip", "src_ip", "src", "c_ip", "remote_addr",
-                         "X-Forwarded-For", "CF-Connecting-IP", "ip"], "apache client ip",
-                forced=args.apache_ip_col, exclude=["ip_report"])
-    a_ua = pick(apache, ["User Agent", "useragent", "http_user_agent"], "apache user agent")
-    a_note = pick(apache, ["Notes", "Note", "Comment"], "apache notes")
-    for k, v in [("time", a_time), ("raw", a_raw), ("method", a_meth), ("path", a_path), ("status", a_stat),
-                 ("site", a_site), ("server", a_srv), ("client_ip", a_ip), ("user_agent", a_ua), ("notes", a_note)]:
-        mapping.append(("Apache", k, v or "(not found)"))
-
-    if not a_time and not a_raw:
-        sys.exit("ERROR: Apache sheet needs a Date column or a Raw column to get timestamps from.")
-
-    raw = apache[a_raw].astype(str) if a_raw else pd.Series([""] * len(apache))
-    # time: Date column first, Raw as fallback. Build as object dtype throughout --
-    # parse_apache_time returns tz-aware pd.Timestamp/NaT per element, and newer pandas
-    # refuses to assign tz-aware values into an already-typed naive datetime64 Series.
-    if a_time:
-        times = apache[a_time].map(lambda v: parse_apache_time(v, args.apache_tz_offset)).astype(object)
-    else:
-        times = pd.Series([pd.NaT] * len(apache), index=apache.index, dtype=object)
-    missing = times.isna()
-    if missing.any() and a_raw:
-        times.loc[missing] = raw.loc[missing].map(lambda v: parse_apache_time(v, args.apache_tz_offset))
-    # method / path: columns first, Raw request-line as fallback
-    req = raw.str.extract(APACHE_REQ)
-    meth = apache[a_meth].astype(str).str.upper().str.strip() if a_meth else req[0].str.upper()
-    path = apache[a_path].astype(str).str.strip() if a_path else req[1]
-    if a_meth:
-        meth = meth.where(~meth.isin(["", "NAN", "-"]), req[0].str.upper())
-    if a_path:
-        path = path.where(~path.isin(["", "nan", "-"]), req[1])
-    status = apache[a_stat] if a_stat else raw.str.extract(r"HTTP/\d(?:\.\d)?\"?\s+(\d{3})\b")[0]
-
-    apo = pd.DataFrame({
-        "Timestamp_UTC": pd.to_datetime(times, utc=True, errors="coerce"),
-        "Source": "Apache",
-        "Server": apache[a_srv].astype(str) if a_srv else "",
-        "Website": apache[a_site].map(norm_host) if a_site else "",
-        "Website_Raw": apache[a_site].astype(str) if a_site else "",
-        "Client_IP": apache[a_ip].astype(str) if a_ip else "",
-        "Method": meth,
-        "URI": path,
-        "Path_Key": path.map(norm_path),
-        "WebServer_Response": status,
-        "CF_Edge_Response": "",
-        "CF_Origin_Response": "",
-        "CF_Origin_IP": "",
-        "CF_Action": "",
-        "CF_Rule": "",
-        "User_Agent": apache[a_ua].astype(str) if a_ua else "",
-        "Notes": apache[a_note].astype(str).replace("nan", "") if a_note else "",
-        "CF_Action_Class": "",
-    })
-    apo["Apache_Client_IP_Class"] = apo["Client_IP"].map(classify_ip) if a_ip else ""
-    cfo["Apache_Client_IP_Class"] = ""
-
-    # If the Apache 'site' column is really a Splunk source path, pull a hostname-looking token out of it
-    if a_site and apo["Website"].str.contains("/").any():
-        apo["Website"] = apo["Website_Raw"].str.extract(r"([a-z0-9][a-z0-9.-]+\.[a-z]{2,})", flags=re.I)[0].map(norm_host)
-
-    # Parent domain (transunion.com / crivo.com.br / mysmartmove.com) so per-vhost noise can be rolled up
-    for df in (cfo, apo):
-        df["Domain"] = df["Website"].map(parent_domain)
-
-    use_host = not args.ignore_host and bool(a_site) and apo["Website"].replace("", np.nan).notna().mean() > 0.5
-    if not use_host:
-        print("[!] Matching on METHOD + PATH only (no usable Apache site column). Pass --apache-site-col to change.")
-    for df in (cfo, apo):
-        df["Match_Key"] = (df["Website"] + "|" if use_host else "") + df["Method"] + " " + df["Path_Key"]
-
-    # ------------------------------------------------------------------ matching
-    cf_keys, ap_keys = set(cfo["Match_Key"]), set(apo["Match_Key"])
-    cfo["Seen_In_Both"] = cfo["Match_Key"].isin(ap_keys)
-    apo["Seen_In_Both"] = apo["Match_Key"].isin(cf_keys)
-
-    cfo_ok = cfo.dropna(subset=["Timestamp_UTC"])
-    apo_ok = apo.dropna(subset=["Timestamp_UTC"])
-    d_cf, i_cf = nearest_same_key(cfo_ok, apo_ok)   # Cloudflare -> nearest Apache (minutes, cf minus apache)
-    d_ap, i_ap = nearest_same_key(apo_ok, cfo_ok)   # Apache -> nearest Cloudflare
-    cfo["Nearest_Other_Delta_Min"] = (-d_cf).round(2)   # positive = Apache saw it AFTER Cloudflare
-    apo["Nearest_Other_Delta_Min"] = d_ap.round(2)      # positive = Apache saw it AFTER Cloudflare
-    cfo["Nearest_Other_Idx"] = i_cf
-    apo["Nearest_Other_Idx"] = i_ap
-
-    def cf_flag(r):
-        if not r["Seen_In_Both"]:
-            return ""
-        within = pd.notna(r["Nearest_Other_Delta_Min"]) and abs(r["Nearest_Other_Delta_Min"]) <= args.window_min
-        cls = r["CF_Action_Class"]
-        if cls == "blocked":
-            return "BLOCKED at CF, reached origin (within window)" if within else "BLOCKED at CF, same request seen at origin (outside window)"
-        if cls == "challenged":
-            return "CHALLENGED at CF, reached origin" if within else "CHALLENGED at CF, seen at origin (outside window)"
-        if cls.startswith("edge 403"):
-            return "CF 403, reached origin" if within else "CF 403, seen at origin (outside window)"
-        return "allowed, seen at origin" if within else "allowed, seen at origin (outside window)"
-
-    cfo["Flag"] = cfo.apply(cf_flag, axis=1)
-
-    def ap_flag(r):
-        if not r["Seen_In_Both"]:
-            return "origin only (never seen at Cloudflare)" if use_host else "origin only"
-        j = r["Nearest_Other_Idx"]
-        if j < 0 or j not in cfo.index:
-            return "seen at both"
-        cls = cfo.at[j, "CF_Action_Class"]
-        within = pd.notna(r["Nearest_Other_Delta_Min"]) and abs(r["Nearest_Other_Delta_Min"]) <= args.window_min
-        if cls == "blocked":
-            return "reached origin although CF BLOCKED it" + ("" if within else " (outside window)")
-        if cls == "challenged":
-            return "reached origin although CF CHALLENGED it" + ("" if within else " (outside window)")
-        return "reached origin, CF allowed" + ("" if within else " (outside window)")
-
-    apo["Flag"] = apo.apply(ap_flag, axis=1)
-
-    # ------------------------------------------------------------------ merged timeline
-    if args.lean:
-        cols = ["Timestamp_UTC", "Source", "Domain", "Website", "Server", "Client_IP", "Method", "URI",
-                "WebServer_Response", "CF_Edge_Response", "CF_Action", "CF_Rule", "Flag"]
-    else:
-        cols = ["Timestamp_UTC", "Source", "Domain", "Website", "Server", "Client_IP", "Apache_Client_IP_Class",
-                "Method", "URI", "WebServer_Response", "CF_Edge_Response", "CF_Origin_Response", "CF_Action",
-                "CF_Action_Class", "CF_Rule", "Seen_In_Both", "Nearest_Other_Delta_Min", "Flag", "User_Agent",
-                "Notes", "Match_Key"]
-    merged = pd.concat([cfo, apo], ignore_index=True)
-    merged = merged.sort_values(["Timestamp_UTC", "Source"], kind="mergesort").reset_index(drop=True)
-    merged_out = merged[cols].copy()
-    merged_out["Timestamp_UTC"] = merged_out["Timestamp_UTC"].dt.tz_localize(None)   # Excel can't store tz
-
-    # ------------------------------------------------------------------ receipts: blocked but reached origin
-    hits = cfo[cfo["Flag"].str.startswith(("BLOCKED", "CHALLENGED", "CF 403")) & (cfo["Nearest_Other_Idx"] >= 0)].copy()
-    rows = []
-    for _, r in hits.iterrows():
-        a = apo.loc[r["Nearest_Other_Idx"]]
-        rows.append({
-            "CF_Time_UTC": r["Timestamp_UTC"].tz_localize(None) if pd.notna(r["Timestamp_UTC"]) else None,
-            "Apache_Time_UTC": a["Timestamp_UTC"].tz_localize(None) if pd.notna(a["Timestamp_UTC"]) else None,
-            "Delta_Min (Apache - CF)": r["Nearest_Other_Delta_Min"],
-            "Within_Window": abs(r["Nearest_Other_Delta_Min"]) <= args.window_min if pd.notna(r["Nearest_Other_Delta_Min"]) else False,
-            "Website": r["Website"], "Method": r["Method"], "URI": r["URI"],
-            "CF_Action": r["CF_Action"], "CF_Action_Class": r["CF_Action_Class"], "CF_Rule": r["CF_Rule"],
-            "CF_Edge_Response": r["CF_Edge_Response"], "CF_Origin_Response": r["CF_Origin_Response"],
-            "Apache_Server": a["Server"], "Apache_Response": a["WebServer_Response"],
-            "Apache_Client_IP": a["Client_IP"], "Apache_Client_IP_Class": a["Apache_Client_IP_Class"],
-            "Apache_URI": a["URI"], "CF_Client_IP": r["Client_IP"],
-        })
-    receipts = pd.DataFrame(rows).sort_values(["Within_Window", "CF_Time_UTC"], ascending=[False, True]) if rows else pd.DataFrame(
-        columns=["CF_Time_UTC", "Apache_Time_UTC", "Delta_Min (Apache - CF)", "Within_Window", "Website", "Method", "URI"])
-
-    # ------------------------------------------------------------------ summary by site / by domain
-    def site_summary(group_col="Website"):
-        sites = sorted(set(cfo[group_col]) | set(apo[group_col]))
-        out = []
-        for s in sites:
-            c = cfo[cfo[group_col] == s]
-            a = apo[apo[group_col] == s]
-            both = set(c["Match_Key"]) & set(a["Match_Key"])
-            blk = c[c["CF_Action_Class"] == "blocked"]
-            out.append({
-                group_col: s or "(unknown)",
-                **({"Vhosts": int(pd.concat([c["Website"], a["Website"]]).nunique())} if group_col == "Domain" else {}),
-                "CF_Requests": len(c),
-                "CF_Blocked": len(blk),
-                "CF_Challenged": int((c["CF_Action_Class"] == "challenged").sum()),
-                "CF_Allowed": int(c["CF_Action_Class"].str.startswith("allowed").sum()),
-                "CF_Edge_2xx": int(pd.to_numeric(c["CF_Edge_Response"], errors="coerce").between(200, 299).sum()),
-                "Apache_Requests": len(a),
-                "Apache_2xx": int(pd.to_numeric(a["WebServer_Response"], errors="coerce").between(200, 299).sum()),
-                "Apache_5xx": int(pd.to_numeric(a["WebServer_Response"], errors="coerce").between(500, 599).sum()),
-                "Distinct_Keys_Seen_Both": len(both),
-                "Blocked_At_CF_But_Reached_Origin": int(c["Flag"].str.startswith("BLOCKED").sum()),
-                "Blocked_Reached_Origin_Within_Window": int((c["Flag"] == "BLOCKED at CF, reached origin (within window)").sum()),
-                "Median_Delta_Min (Apache - CF)": round(float(c.loc[c["Seen_In_Both"], "Nearest_Other_Delta_Min"].median()), 2)
-                if c["Seen_In_Both"].any() else None,
-                "Apache_Client_IP_Classes": ", ".join(f"{k}:{v}" for k, v in a["Apache_Client_IP_Class"].value_counts().items() if k) or "(no IP column)",
-            })
-        return pd.DataFrame(out)
-
-    summary = site_summary("Website")
-    domain_summary = site_summary("Domain")
-
-    # ------------------------------------------------------------------ delta distribution
-    dd = cfo.loc[cfo["Seen_In_Both"], "Nearest_Other_Delta_Min"].dropna()
-    if len(dd):
-        buckets = pd.cut(dd, bins=[-np.inf, -60, -30, -10, -2, -0.5, 0.5, 2, 5, 10, 30, 60, np.inf])
-        delta_tbl = buckets.value_counts().sort_index().rename_axis("Delta_Min (Apache - CF)").reset_index(name="CF_Events")
-        delta_tbl["Delta_Min (Apache - CF)"] = delta_tbl["Delta_Min (Apache - CF)"].astype(str)
-        delta_note = pd.DataFrame({"Delta_Min (Apache - CF)": [
-            "", "How to read:",
-            "A tight cluster near one value = same requests, origin clock is skewed by that amount.",
-            "A wide spread (minutes apart, varying) = separate requests; the origin was hit independently of Cloudflare.",
-            f"Median = {dd.median():.2f} min, std dev = {dd.std():.2f} min, n = {len(dd)}",
-        ], "CF_Events": ["", "", "", "", ""]})
-        delta_tbl = pd.concat([delta_tbl, delta_note], ignore_index=True)
-    else:
-        delta_tbl = pd.DataFrame({"Delta_Min (Apache - CF)": ["no matched keys"], "CF_Events": [0]})
-
-    mapping_df = pd.DataFrame(mapping, columns=["Sheet", "Field", "Column_Used"])
-    mapping_df = pd.concat([mapping_df, pd.DataFrame([
-        ("Settings", "apache_tz_offset_hours", args.apache_tz_offset),
-        ("Settings", "pair_window_min", args.window_min),
-        ("Settings", "match_on", "website|method path" if use_host else "method path (host ignored)"),
-        ("Settings", "cf_rows", len(cfo)), ("Settings", "apache_rows", len(apo)),
-        ("Settings", "cf_rows_no_timestamp", int(cfo["Timestamp_UTC"].isna().sum())),
-        ("Settings", "apache_rows_no_timestamp", int(apo["Timestamp_UTC"].isna().sum())),
-    ], columns=["Sheet", "Field", "Column_Used"])], ignore_index=True)
-
-    # ------------------------------------------------------------------ write
-    # IMPORTANT: format using the SAME live workbook the writer already holds in memory.
-    # Never call load_workbook() on the output afterward -- for an 850k-row sheet that
-    # re-parses the whole file a second time and is what blows out RAM (MemoryError).
-    # Also: no per-cell fills on the big sheet -- that's ~850k x 8 extra Python objects.
-    # Use a light, formula-based conditional format instead (cheap, no per-cell objects).
-    print(f"[*] Writing {out}")
-    BIG_SHEET_ROWS = len(merged_out)
-    SKIP_ROW_COLORING = BIG_SHEET_ROWS > 150_000
-    if SKIP_ROW_COLORING:
-        print(f"    ({BIG_SHEET_ROWS:,} rows on Merged_Timeline -- using light conditional "
-              f"formatting instead of per-cell fills, to avoid the memory a full reload+per-row "
-              f"colouring pass would need)")
-
-    with pd.ExcelWriter(out, engine="openpyxl", datetime_format="yyyy-mm-dd hh:mm:ss.000") as xw:
-        merged_out.to_excel(xw, sheet_name="Merged_Timeline", index=False)
-        receipts.to_excel(xw, sheet_name="Blocked_But_Reached_Origin", index=False)
-        domain_summary.to_excel(xw, sheet_name="Summary_By_Domain", index=False)
-        summary.to_excel(xw, sheet_name="Summary_By_Site", index=False)
-        if not args.lean:
-            delta_tbl.to_excel(xw, sheet_name="Delta_Analysis", index=False)
-            mapping_df.to_excel(xw, sheet_name="Column_Mapping", index=False)
-
-        wb = xw.book                                    # the live workbook -- no reload
-        fill_cf = PatternFill("solid", fgColor="DDEBF7")      # light blue
-        fill_ap = PatternFill("solid", fgColor="FCE4D6")      # light orange
-        fill_both = PatternFill("solid", fgColor="C6EFCE")    # green
-        fill_bad = PatternFill("solid", fgColor="FFC7CE")     # red
-        bold = Font(bold=True)
-
-        ws = wb["Merged_Timeline"]
-        hdr = {c.value: c.column for c in ws[1]}
-        widths = {"Timestamp_UTC": 24, "Source": 11, "Domain": 20, "Website": 30, "Server": 14, "Client_IP": 16,
-                  "Apache_Client_IP_Class": 20, "Method": 8, "URI": 60, "WebServer_Response": 10,
-                  "CF_Edge_Response": 10, "CF_Origin_Response": 10, "CF_Action": 18, "CF_Action_Class": 24,
-                  "CF_Rule": 30, "Seen_In_Both": 12, "Nearest_Other_Delta_Min": 14, "Flag": 48,
-                  "User_Agent": 30, "Notes": 24, "Match_Key": 50}
-        for name, w in widths.items():
-            if name in hdr:
-                ws.column_dimensions[get_column_letter(hdr[name])].width = w
-        ws.freeze_panes = "C2"
-        ws.auto_filter.ref = ws.dimensions
-        for c in ws[1]:
-            c.font = bold
-            c.alignment = Alignment(wrap_text=True, vertical="top")
-
-        if SKIP_ROW_COLORING:
-            # formula-based conditional formatting: Excel evaluates these itself, no per-cell
-            # Python objects, so it stays cheap even at 800k+ rows.
-            from openpyxl.formatting.rule import FormulaRule
-            last_row = ws.max_row
-            src_col = get_column_letter(hdr["Source"])
-            flag_col = get_column_letter(hdr["Flag"])
-            ws.conditional_formatting.add(
-                f"A2:H{last_row}",
-                FormulaRule(formula=[f'${src_col}2="Cloudflare"'], fill=fill_cf))
-            ws.conditional_formatting.add(
-                f"A2:H{last_row}",
-                FormulaRule(formula=[f'${src_col}2="Apache"'], fill=fill_ap))
-            if "Match_Key" in hdr and "Seen_In_Both" in hdr:
-                key_col = get_column_letter(hdr["Match_Key"])
-                both_col = get_column_letter(hdr["Seen_In_Both"])
-                ws.conditional_formatting.add(
-                    f"{key_col}2:{key_col}{last_row}",
-                    FormulaRule(formula=[f'${both_col}2=TRUE'], fill=fill_both))
-            ws.conditional_formatting.add(
-                f"{flag_col}2:{flag_col}{last_row}",
-                FormulaRule(formula=[f'OR(LEFT(${flag_col}2,7)="BLOCKED",'
-                                      f'LEFT(${flag_col}2,10)="CHALLENGED",'
-                                      f'LEFT(${flag_col}2,6)="CF 403",'
-                                      f'LEFT(${flag_col}2,22)="reached origin although")'],
-                            fill=fill_bad, font=bold))
-        else:
-            for row in ws.iter_rows(min_row=2):
-                src = row[hdr["Source"] - 1].value
-                f = fill_cf if src == "Cloudflare" else fill_ap
-                for cell in row[:8]:
-                    cell.fill = f
-                if "Seen_In_Both" in hdr and row[hdr["Seen_In_Both"] - 1].value is True:
-                    row[hdr["Match_Key"] - 1].fill = fill_both
-                fv = str(row[hdr["Flag"] - 1].value or "")
-                if fv.startswith(("BLOCKED", "CHALLENGED", "CF 403", "reached origin although")):
-                    row[hdr["Flag"] - 1].fill = fill_bad
-                    row[hdr["Flag"] - 1].font = bold
-
-        for name in ("Blocked_But_Reached_Origin", "Summary_By_Domain", "Summary_By_Site",
-                     "Delta_Analysis", "Column_Mapping"):
-            if name not in wb.sheetnames:
-                continue
-            w = wb[name]
-            w.freeze_panes = "A2"
-            if w.max_row > 1:
-                w.auto_filter.ref = w.dimensions
-            for c in w[1]:
-                c.font = bold
-            for col in w.columns:
-                width = max((len(str(c.value)) for c in col if c.value is not None), default=8)
-                w.column_dimensions[get_column_letter(col[0].column)].width = min(max(10, width + 2), 60)
-
-        ws2 = wb["Blocked_But_Reached_Origin"]
-        if ws2.max_row > 1:
-            h2 = {c.value: c.column for c in ws2[1]}
-            for row in ws2.iter_rows(min_row=2):
-                if row[h2["Within_Window"] - 1].value is True:
-                    row[h2["Within_Window"] - 1].fill = fill_bad
-        # context manager (`with pd.ExcelWriter ... as xw`) saves automatically on exit --
-        # no extra wb.save(out) call, and no second load_workbook() of this file, ever.
-
-    # ------------------------------------------------------------------ console summary
-    print("\n=== RESULT ===")
-    print(f"Cloudflare rows: {len(cfo):,}   Apache rows: {len(apo):,}   merged: {len(merged):,}")
-    print(f"Distinct keys seen on BOTH sides: {len(cf_keys & ap_keys):,}")
-    print("Cloudflare action classes:")
-    print(cfo["CF_Action_Class"].value_counts().to_string())
-    nb = int(cfo["Flag"].str.startswith("BLOCKED").sum())
-    nbw = int((cfo["Flag"] == "BLOCKED at CF, reached origin (within window)").sum())
-    print(f"\nBLOCKED at Cloudflare but same request seen at origin: {nb:,}  (within {args.window_min:g} min: {nbw:,})")
-    if len(dd):
-        print(f"Apache-minus-Cloudflare delta for matched keys: median {dd.median():.2f} min, "
-              f"std {dd.std():.2f} min, min {dd.min():.2f}, max {dd.max():.2f}")
-    if a_ip:
-        print("\nApache client IP classes:")
-        print(apo["Apache_Client_IP_Class"].value_counts().to_string())
-    else:
-        print("\n[!] Apache sheet has NO client-IP column. Cannot tell whether origin hits came via Cloudflare "
-              "edge IPs or directly from the attacker IP. Get the raw access log with %h / X-Forwarded-For.")
-    print("\nBy parent domain:")
-    print(domain_summary[["Domain", "Vhosts", "CF_Requests", "CF_Blocked", "Apache_Requests", "Apache_2xx"]]
-          .to_string(index=False))
-    print(f"\nOutput: {out}")
-    if args.lean:
-        print("Sheets: Merged_Timeline | Blocked_But_Reached_Origin | Summary_By_Domain | Summary_By_Site  (--lean)")
-    else:
-        print("Sheets: Merged_Timeline | Blocked_But_Reached_Origin | Summary_By_Domain | Summary_By_Site | "
-              "Delta_Analysis | Column_Mapping")
-
-
-if __name__ == "__main__":
-    main()
+<#
+  BrotliShell remediation update -> Word document (.docx)
+
+  Builds the .docx directly as Office Open XML, so Microsoft Word does not
+  need to be installed. Works in Windows PowerShell 5.1 and PowerShell 7+.
+
+  Usage:   .\BrotliShell_Update.ps1
+           (If blocked by policy: powershell -ExecutionPolicy Bypass -File .\BrotliShell_Update.ps1)
+
+  To reuse for the next update, edit only the CONTENT section and run again.
+  Inside single-quoted strings, write an apostrophe as two: ''
+#>
+
+$ErrorActionPreference = 'Stop'
+
+# =============================== CONTENT ===============================
+
+$OutName = 'BrotliShell_Update_2026-11-10.docx'
+
+$Greeting = 'See below,'
+
+$ExposureHeading = 'Exposure and Remediation'
+$ExposureParagraphs = @(
+    'The latest assessment from Vulnerability Resiliency identifies 37,837 affected assets, including 1,462 internet-exposed and 13,136 production assets, up from 30,098 in the previous update. These are counts of unique assets, not scan findings. Most of the increase appears to reflect wider Wiz scan coverage rather than new installs, and 5,200 assets have cleared scan results since November 5.'
+    'The latest European tracking dashboard reports 91% remediation, with 4,853 assets marked remediated, up from 86% and 4,565 in the previous update.'
+)
+
+$TableHeader = @('Environment', 'Latest Remediation Status')
+$TableRows = @(
+    [pscustomobject]@{ Env = 'OneTru/OneDev'; Status = 'Wiz reporting now covers all of OneTru and identifies 6,476 affected assets, with 20 internet-reachable findings as the top priority. Deletion of non-production staging and QA VMs that the team cannot access is pending under OTCFDEVOPS-13074. OneDev, tracked separately, has 542 affected assets, none internet-exposed.' }
+    [pscustomobject]@{ Env = 'RN/Bonafide';   Status = 'All highest-priority systems patched. Twenty production instances were targeted for patching or termination by November 10, with one additional instance awaiting a maintenance window. Confirmation of completion is pending.' }
+    [pscustomobject]@{ Env = 'UK';            Status = 'External-facing remediation reported 99% complete; a Tanium scan identified one failed remediation, which is being worked as a priority. Internal remediation has increased to 90% and is on track for the November 11 deadline.' }
+    [pscustomobject]@{ Env = 'Spain';         Status = 'Fully patched and validated.' }
+    [pscustomobject]@{ Env = 'Monevo';        Status = 'External-facing and internal remediation both reported 100% complete. One externally exposed asset is still being investigated to clarify its exposure.' }
+)
+
+$DetectionHeading = 'Detection & Response'
+$DetectionBullets = @(
+    [pscustomobject]@{ Label = ''; Text = 'TDS extended the existing Cloudflare alert to cover BrotliShell. New CrowdStrike and Microsoft Defender for Endpoint detections are automatically ingested and alert to CDOC.' }
+    [pscustomobject]@{ Label = ''; Text = 'CDOC reports no BrotliShell-related alerts or investigations to date.' }
+)
+
+$RisksHeading = 'Risks & Outstanding Work'
+$RiskBullets = @(
+    [pscustomobject]@{ Label = 'Internet-facing exposure:'; Text = 'The current assessment identifies 1,462 internet-exposed assets. This is a minimum, as internet exposure could not be determined for some assets.' }
+    [pscustomobject]@{ Label = 'Remaining remediation:';    Text = 'UK internal systems, OneTru assets, and RN/Bonafide production instances remain in progress.' }
+)
+
+$Closing   = 'Thanks,'
+$Signature = 'Powlos'
+
+# ============================ LAYOUT / XML =============================
+
+$Col1 = 2200   # table column widths in twips (1440 = 1 inch);
+$Col2 = 7160   # Col1 + Col2 = 9360 = Letter width minus 1" margins
+
+$BodyPPr    = '<w:spacing w:after="160" w:line="264" w:lineRule="auto"/>'
+$HeadingPPr = '<w:keepNext/><w:spacing w:before="200" w:after="100"/>'
+$BulletPPr  = '<w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr><w:spacing w:after="80" w:line="264" w:lineRule="auto"/>'
+$CellPPr    = '<w:spacing w:after="0" w:line="264" w:lineRule="auto"/>'
+$ClosingPPr = '<w:spacing w:before="240" w:after="0"/>'
+
+function ConvertTo-XmlText([string]$Text) {
+    [System.Security.SecurityElement]::Escape($Text)
+}
+
+function New-WRun([string]$Text, [switch]$Bold) {
+    $rPr = if ($Bold) { '<w:rPr><w:b/><w:bCs/></w:rPr>' } else { '' }
+    '<w:r>' + $rPr + '<w:t xml:space="preserve">' + (ConvertTo-XmlText $Text) + '</w:t></w:r>'
+}
+
+function New-WPara([string]$Runs, [string]$PPr) {
+    '<w:p><w:pPr>' + $PPr + '</w:pPr>' + $Runs + '</w:p>'
+}
+
+function New-WBullet($Item) {
+    $runs = ''
+    if ($Item.Label) { $runs += New-WRun ($Item.Label + ' ') -Bold }
+    $runs += New-WRun $Item.Text
+    New-WPara $runs $BulletPPr
+}
+
+function New-WCell([string]$Text, [int]$Width, [switch]$Bold, [switch]$Header) {
+    $shd = if ($Header) { '<w:shd w:val="clear" w:color="auto" w:fill="D9E2F3"/>' } else { '' }
+    '<w:tc><w:tcPr><w:tcW w:w="' + $Width + '" w:type="dxa"/>' + $shd + '</w:tcPr>' +
+        (New-WPara (New-WRun $Text -Bold:$Bold) $CellPPr) + '</w:tc>'
+}
+
+function New-WTable {
+    $b = 'w:val="single" w:sz="4" w:space="0" w:color="A6A6A6"'
+    $xml = '<w:tbl><w:tblPr>' +
+        '<w:tblW w:w="' + ($Col1 + $Col2) + '" w:type="dxa"/>' +
+        '<w:tblBorders><w:top ' + $b + '/><w:left ' + $b + '/><w:bottom ' + $b + '/><w:right ' + $b + '/>' +
+        '<w:insideH ' + $b + '/><w:insideV ' + $b + '/></w:tblBorders>' +
+        '<w:tblLayout w:type="fixed"/>' +
+        '<w:tblCellMar><w:top w:w="80" w:type="dxa"/><w:left w:w="120" w:type="dxa"/>' +
+        '<w:bottom w:w="80" w:type="dxa"/><w:right w:w="120" w:type="dxa"/></w:tblCellMar>' +
+        '</w:tblPr>' +
+        '<w:tblGrid><w:gridCol w:w="' + $Col1 + '"/><w:gridCol w:w="' + $Col2 + '"/></w:tblGrid>'
+
+    # Header row repeats on each page if the table breaks
+    $xml += '<w:tr><w:trPr><w:cantSplit/><w:tblHeader/></w:trPr>' +
+        (New-WCell $TableHeader[0] $Col1 -Bold -Header) +
+        (New-WCell $TableHeader[1] $Col2 -Bold -Header) + '</w:tr>'
+
+    foreach ($row in $TableRows) {
+        $xml += '<w:tr><w:trPr><w:cantSplit/></w:trPr>' +
+            (New-WCell $row.Env $Col1 -Bold) +
+            (New-WCell $row.Status $Col2) + '</w:tr>'
+    }
+    $xml + '</w:tbl>'
+}
+
+# ---- document body ----
+$body = New-Object System.Collections.Generic.List[string]
+$body.Add((New-WPara (New-WRun $Greeting) $BodyPPr))
+
+$body.Add((New-WPara (New-WRun $ExposureHeading -Bold) $HeadingPPr))
+foreach ($p in $ExposureParagraphs) { $body.Add((New-WPara (New-WRun $p) $BodyPPr)) }
+$body.Add((New-WTable))
+
+$body.Add((New-WPara (New-WRun $DetectionHeading -Bold) $HeadingPPr))
+foreach ($item in $DetectionBullets) { $body.Add((New-WBullet $item)) }
+
+$body.Add((New-WPara (New-WRun $RisksHeading -Bold) $HeadingPPr))
+foreach ($item in $RiskBullets) { $body.Add((New-WBullet $item)) }
+
+$body.Add((New-WPara (New-WRun $Closing) $ClosingPPr))
+$body.Add((New-WPara (New-WRun $Signature) $BodyPPr))
+
+$DocumentXml =
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+    '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" ' +
+    'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body>' +
+    ($body -join '') +
+    '<w:sectPr><w:pgSz w:w="12240" w:h="15840"/>' +
+    '<w:pgMar w:top="1080" w:right="1440" w:bottom="1080" w:left="1440" w:header="720" w:footer="720" w:gutter="0"/>' +
+    '</w:sectPr></w:body></w:document>'
+
+# ---- static package parts ----
+$ContentTypesXml = @'
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/><Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/></Types>
+'@
+
+$RootRelsXml = @'
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>
+'@
+
+$DocRelsXml = @'
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering" Target="numbering.xml"/></Relationships>
+'@
+
+# Calibri 11 pt default font
+$StylesXml = @'
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:eastAsia="Calibri" w:cs="Calibri"/><w:sz w:val="22"/><w:szCs w:val="22"/><w:lang w:val="en-US"/></w:rPr></w:rPrDefault><w:pPrDefault><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr></w:pPrDefault></w:docDefaults><w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:qFormat/></w:style><w:style w:type="table" w:default="1" w:styleId="TableNormal"><w:name w:val="Normal Table"/><w:uiPriority w:val="99"/><w:semiHidden/><w:unhideWhenUsed/><w:tblPr><w:tblInd w:w="0" w:type="dxa"/><w:tblCellMar><w:top w:w="0" w:type="dxa"/><w:left w:w="108" w:type="dxa"/><w:bottom w:w="0" w:type="dxa"/><w:right w:w="108" w:type="dxa"/></w:tblCellMar></w:tblPr></w:style></w:styles>
+'@
+
+# Bullet list definition (&#8226; is the bullet character)
+$NumberingXml = @'
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:abstractNum w:abstractNumId="0"><w:multiLevelType w:val="hybridMultilevel"/><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="bullet"/><w:lvlText w:val="&#8226;"/><w:lvlJc w:val="left"/><w:pPr><w:ind w:left="720" w:hanging="360"/></w:pPr></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>
+'@
+
+$Parts = [ordered]@{
+    '[Content_Types].xml'          = $ContentTypesXml
+    '_rels/.rels'                  = $RootRelsXml
+    'word/document.xml'            = $DocumentXml
+    'word/_rels/document.xml.rels' = $DocRelsXml
+    'word/styles.xml'              = $StylesXml
+    'word/numbering.xml'           = $NumberingXml
+}
+
+# ============================== WRITE FILE ==============================
+
+$OutDir  = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).ProviderPath }
+$OutFile = Join-Path $OutDir $OutName
+
+Add-Type -AssemblyName System.IO.Compression
+
+if (Test-Path -LiteralPath $OutFile) {
+    try   { Remove-Item -LiteralPath $OutFile -Force }
+    catch { throw "Cannot overwrite $OutFile - close it in Word and run the script again." }
+}
+
+$utf8NoBom  = New-Object System.Text.UTF8Encoding $false
+$fileStream = [System.IO.File]::Open($OutFile, [System.IO.FileMode]::CreateNew)
+try {
+    $zip = New-Object System.IO.Compression.ZipArchive -ArgumentList $fileStream, ([System.IO.Compression.ZipArchiveMode]::Create)
+    try {
+        foreach ($name in $Parts.Keys) {
+            $entryStream = $zip.CreateEntry($name).Open()
+            $writer = New-Object System.IO.StreamWriter -ArgumentList $entryStream, $utf8NoBom
+            try     { $writer.Write($Parts[$name]) }
+            finally { $writer.Dispose() }
+        }
+    }
+    finally { $zip.Dispose() }
+}
+finally { $fileStream.Dispose() }
+
+Write-Host "Wrote $OutFile"
